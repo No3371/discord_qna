@@ -217,6 +217,23 @@ func (b *Bot) registerCommands() error {
             },
             DefaultMemberPermissions: &perm,
         },
+        {
+            Name:        "list",
+            Description: "Show a list of recent questions",
+            Options: []discord.CommandOption {
+                &discord.IntegerOption{
+                    OptionName:  "count",
+                    Description: "How many recent questions to show? <1-50>",
+                    Required:    false,
+                },
+                &discord.BooleanOption{
+                    OptionName:  "public",
+                    Description: "Show to everyone",
+                    Required:    false,
+                },
+            },
+            DefaultMemberPermissions: &perm,
+        },
     }
 
     if _, err := b.s.BulkOverwriteCommands(b.s.Ready().Application.ID, commands); err != nil {
@@ -256,6 +273,8 @@ func (b *Bot) handleInteraction(e *gateway.InteractionCreateEvent) {
             b.handleAskMarkdownCommand(e)
         case "analyze":
             b.handleAnalyzeCommand(e)
+        case "list":
+            b.handleListCommand(e)
         }
     case *discord.ButtonInteraction:
         b.handleButtonClick(e)
@@ -380,8 +399,8 @@ func (b *Bot) handleResultCommand(e *gateway.InteractionCreateEvent) {
     }
 
     showToEveryone := false
-    if data.Options.Find("public").Name != "" {
-        showToEveryone, err = data.Options[1].BoolValue()
+    if opt := data.Options.Find("public"); opt.Name != "" {
+        showToEveryone, err = opt.BoolValue()
         if err != nil {
             b.respondError(e, "Invalid public value")
             return
@@ -569,6 +588,85 @@ func (b *Bot) handleAskMarkdownCommand(e *gateway.InteractionCreateEvent) {
     b.respond(e, fmt.Sprintf("Poll created with ID: %d", questionID), discord.EphemeralMessage)
 }
 
+func (b *Bot) handleListCommand(e *gateway.InteractionCreateEvent) {
+    data := e.Data.(*discord.CommandInteraction)
+    
+    // Check permissions
+    member, err := b.s.Member(e.GuildID, e.Member.User.ID)
+    if err != nil {
+        b.respondError(e, "Failed to get member")
+        return
+    }
+    perms, err := b.s.Permissions(e.ChannelID, member.User.ID)
+    if err != nil || !perms.Has(discord.PermissionManageChannels) {
+        b.respondError(e, "You need to have the Manage Channels permission to view polls")
+        return
+    }
+
+    count := int64(10)
+    if opt := data.Options.Find("count"); opt.Name != "" {
+        count, err = opt.IntValue()
+        if err != nil {
+            b.respondError(e, "Invalid count value")
+            return
+        }
+    }
+
+    showToEveryone := false
+    if opt := data.Options.Find("public"); opt.Name != "" {
+        showToEveryone, err = opt.BoolValue()
+        if err != nil {
+            b.respondError(e, "Invalid public value")
+            return
+        }
+    }
+
+    // Get recent questions
+    rows, err := b.db.Query(`
+        SELECT id, question, creation_time
+        FROM questions 
+        WHERE guild_id = ?
+        ORDER BY creation_time ASC
+        LIMIT ?`,
+        e.GuildID.String(),
+        count,
+    )
+    if err != nil {
+        b.respondError(e, "Failed to get questions")
+        return
+    }
+    defer rows.Close()
+
+    var result strings.Builder
+    result.WriteString("**Recent Questions**\n\n")
+    
+    i := 1
+    for rows.Next() {
+        var id int64
+        var question string
+        var creationTime time.Time
+        err := rows.Scan(&id, &question, &creationTime)
+        if err != nil {
+            continue
+        }
+        
+        result.WriteString(fmt.Sprintf("- **#%d**: %s (<t:%d:R>)\n", 
+            id, question, creationTime.Unix()))
+        i++
+    }
+
+    if i == 1 {
+        b.respondError(e, "No questions found")
+        return
+    }
+
+    if showToEveryone {
+        b.respond(e, result.String(), 0)
+    } else {
+        b.respond(e, result.String(), discord.EphemeralMessage)
+    }
+}
+
 func (b *Bot) handleAnalyzeCommand(e *gateway.InteractionCreateEvent) {
     data := e.Data.(*discord.CommandInteraction)
     
@@ -585,8 +683,8 @@ func (b *Bot) handleAnalyzeCommand(e *gateway.InteractionCreateEvent) {
     }
 
     showToEveryone := false
-    if data.Options.Find("public").Name != "" {
-        showToEveryone, err = data.Options[1].BoolValue()
+    if opt := data.Options.Find("public"); opt.Name != "" {
+        showToEveryone, err = opt.BoolValue()
         if err != nil {
             b.respondError(e, "Invalid public value")
             return
@@ -785,7 +883,7 @@ func (b *Bot) handleAnalyzeCommand(e *gateway.InteractionCreateEvent) {
     for i, q := range questionStats {
         if q.total > 0 {
             percentage := float64(q.correct) * 100 / float64(q.total)
-            result.WriteString(fmt.Sprintf("%d. Question %d: %.1f%% correct (%d/%d)\n",
+            result.WriteString(fmt.Sprintf("%d. Q#%d: %.1f%% correct (%d/%d)\n",
                 i+1, q.id, percentage, q.correct, q.total))
         }
     }
