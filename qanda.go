@@ -715,6 +715,10 @@ func (b *Bot) handleAnalyzeCommand(e *gateway.InteractionCreateEvent) {
                 }
             }
         }
+        
+        if totalResponses == 0 {
+            result.WriteString("❌ *No responses*\n")
+        }
 
         if correctAnswerID >= 0 && totalResponses > 0 {
             correctCount := optionCounts[correctAnswerID]
@@ -729,6 +733,11 @@ func (b *Bot) handleAnalyzeCommand(e *gateway.InteractionCreateEvent) {
         questionStats = append(questionStats, qStats)
         // result.WriteString("\n---\n")
         result.WriteString("\n")
+    }
+
+    if len(questionStats) == 0 {
+        b.respondError(e, "❌ *No question/response data!*")
+        return
     }
 
     // Generate summary
