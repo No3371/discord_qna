@@ -1,961 +1,297 @@
 package main
 
 import (
-	"context"
-	"database/sql"
 	"fmt"
 	"log"
-	"os"
 	"strconv"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/diamondburned/arikawa/v3/api"
 	"github.com/diamondburned/arikawa/v3/discord"
 	"github.com/diamondburned/arikawa/v3/gateway"
-	"github.com/diamondburned/arikawa/v3/state"
 	"github.com/diamondburned/arikawa/v3/utils/json/option"
-	"github.com/joho/godotenv"
+	"github.com/dlclark/regexp2"
 	_ "modernc.org/sqlite"
 )
 
-type Bot struct {
-    s     *state.State
-    db    *sql.DB
-    token string
+var responseButtonRegex = regexp2.MustCompile(`opt_(\d+)_(\d)`, regexp2.None)
+
+type QuestionDraft struct {
+	*Question
+	DraftID    int64
+	lastEdited time.Time
 }
 
-func main() {
-    err := godotenv.Load()
-    if err != nil {
-        panic(err)
-    }
-    token := os.Getenv("BOT_TOKEN")
-    if token == "" {
-        log.Fatal("BOT_TOKEN environment variable is required")
-    }
-
-    bot := &Bot{token: token}
-    if err := bot.Start(); err != nil {
-        log.Fatal("Failed to start bot:", err)
-    }
+type Question struct {
+	QID        int64     `db:"id"`
+	CreatorID  int64     `db:"creator_id"`
+	GuildID    int64     `db:"guild_id"`
+	Question   string    `db:"question"`
+	OptionsStr string    `db:"options"`
+	Answer     int64     `db:"answer_id"`
+	CreatedAt  time.Time `db:"created_at"`
+	IsClosed   bool      `db:"is_closed"`
+	Options    []string
 }
 
-func (b *Bot) Start() error {
-    // Initialize SQLite
-    db, err := sql.Open("sqlite", "poll.db")
-    if err != nil {
-        return fmt.Errorf("failed to open database: %w", err)
-    }
-    b.db = db
-    defer b.db.Close()
+func (b *Bot) queryQuestion(qId int64) (*Question, error) {
+	q := Question{}
+	err := b.db.QueryRow(
+		"SELECT id, creator_id, guild_id, question, options, answer_id, created_at, is_closed FROM questions WHERE id = ?",
+		qId,
+	).Scan(&q.QID, &q.CreatorID, &q.GuildID, &q.Question, &q.OptionsStr, &q.Answer, &q.CreatedAt, &q.IsClosed)
+	if err != nil {
+		return nil, fmt.Errorf("Question not found: %w", err)
+	}
 
-    // Create tables
-    if err := b.createTables(); err != nil {
-        return fmt.Errorf("failed to create tables: %w", err)
-    }
+	if q.OptionsStr != "" {
+		q.Options = strings.Split(q.OptionsStr, "|")
+	}
 
-    // Initialize Discord client
-    b.s = state.New("Bot " + b.token)
-    b.s.AddHandler(b.handleInteraction)
-    b.s.AddIntents(gateway.IntentGuilds | gateway.IntentGuildMessages)
-
-	b.s.AddHandler(func(m *gateway.ReadyEvent) {
-        if err := b.registerCommands(); err != nil {
-            panic(fmt.Errorf("failed to register commands: %w", err))
-        }
-	})
-
-    // Start the bot
-    if err := b.s.Connect(context.Background()); err != nil {
-        return fmt.Errorf("failed to connect: %w", err)
-    }
-
-    return nil
+	return &q, nil
 }
 
-func (b *Bot) createTables() error {
-    queries := []string{
-        `CREATE TABLE IF NOT EXISTS questions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            creator_id TEXT NOT NULL,
-            guild_id TEXT NOT NULL,
-            question TEXT NOT NULL,
-            options TEXT NOT NULL,
-            correct_answer_id INTEGER NOT NULL,
-            creation_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            message_id TEXT NOT NULL,
-            channel_id TEXT NOT NULL,
-            is_closed BOOLEAN DEFAULT FALSE
-        )`,
-        `CREATE TABLE IF NOT EXISTS responses (
-            question_id INTEGER,
-            user_id TEXT NOT NULL,
-            choice TEXT NOT NULL,
-            response_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(question_id) REFERENCES questions(id),
-            UNIQUE(question_id, user_id)
-        )`,
-    }
+func (b *Bot) insertQuestion(q *Question) (*Question, error) {
+	q.OptionsStr = strings.Join(q.Options, "|")
+	result, err := b.db.Exec(
+		"INSERT INTO questions (creator_id, guild_id, question, options, answer_id) VALUES (?, ?, ?, ?, ?)",
+		q.CreatorID,
+		q.GuildID,
+		q.Question,
+		q.OptionsStr,
+		q.Answer,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to store question: %w", err)
+	}
 
-    for _, query := range queries {
-        if _, err := b.db.Exec(query); err != nil {
-            return err
-        }
-    }
-    return nil
+	questionID, _ := result.LastInsertId()
+	err = b.db.QueryRow(
+		"SELECT id, created_at, is_closed FROM questions WHERE id = ?",
+		questionID,
+	).Scan(&q.QID, &q.CreatedAt, &q.IsClosed)
+	if err != nil {
+		return nil, fmt.Errorf("Question not found: %w", err)
+	}
+
+	return q, nil
 }
 
-func (b *Bot) registerCommands() error {
-    perm := discord.PermissionManageChannels
-    commands := []api.CreateCommandData{
-        {
-            Name:        "ask",
-            Description: "Create a new poll",
-            Options: []discord.CommandOption{
-                &discord.StringOption{
-                    OptionName:  "question",
-                    Description: "The question to ask",
-                    Required:    true,
-                },
-                &discord.IntegerOption{
-                    OptionName:  "answer_id",
-                    Description: "Which option is correct?",
-                    Choices: []discord.IntegerChoice{
-                        {Name: "opt1", Value: 0},
-                        {Name: "opt2", Value: 1},
-                        {Name: "opt3", Value: 2},
-                        {Name: "opt4", Value: 3},
-                        {Name: "opt5", Value: 4},
-                        {Name: "opt6", Value: 5},
-                    },
-                    Required:    false,
-                },
-                &discord.StringOption{
-                    OptionName:  "option1",
-                    Description: "1st option",
-                    Required:    false,
-                },
-                &discord.StringOption{
-                    OptionName:  "option2",
-                    Description: "2nd option",
-                    Required:    false,
-                },
-                &discord.StringOption{
-                    OptionName:  "option3",
-                    Description: "3rd option",
-                    Required:    false,
-                },
-                &discord.StringOption{
-                    OptionName:  "option4",
-                    Description: "4th option",
-                    Required:    false,
-                },
-                &discord.StringOption{
-                    OptionName:  "option5",
-                    Description: "5th option",
-                    Required:    false,
-                },
-                &discord.StringOption{
-                    OptionName:  "option6",
-                    Description: "6th option",
-                    Required:    false,
-                },
-                // &discord.BooleanOption{
-                //     OptionName:  "custom",
-                //     Description: "Accept custom answer?",
-                //     Required:    false,
-                // },
-                // Add more options up to option8...
-            },
-            DefaultMemberPermissions: &perm,
-        },
-        {
-            Name:        "result",
-            Description: "Show poll results",
-            Options: []discord.CommandOption{
-                &discord.IntegerOption{
-                    OptionName:  "question_id",
-                    Description: "ID of the poll",
-                    Required:    true,
-                },
-                &discord.BooleanOption{
-                    OptionName:  "public",
-                    Description: "Show to everyone",
-                    Required:    false,
-                },
-            },
-            DefaultMemberPermissions: &perm,
-        },
-        {
-            Name:        "close",
-            Description: "Close a poll",
-            Options: []discord.CommandOption{
-                &discord.IntegerOption{
-                    OptionName:  "question_id",
-                    Description: "ID of the poll",
-                    Required:    true,
-                },
-            },
-            DefaultMemberPermissions: &perm,
-        },
-        {
-            Name:        "analyze",
-            Description: "Analyze multiple questions and show statistics",
-            Options: []discord.CommandOption{
-                &discord.StringOption{
-                    OptionName:  "question_ids",
-                    Description: "Comma-separated list of question IDs (e.g. 1,2,3)",
-                    Required:    true,
-                },
-                &discord.BooleanOption{
-                    OptionName:  "public",
-                    Description: "Show to everyone",
-                    Required:    false,
-                },
-            },
-            DefaultMemberPermissions: &perm,
-        },
-        {
-            Name:        "list",
-            Description: "Show a list of recent questions",
-            Options: []discord.CommandOption {
-                &discord.IntegerOption{
-                    OptionName:  "count",
-                    Description: "How many recent questions to show? <1-50>",
-                    Required:    false,
-                },
-                &discord.BooleanOption{
-                    OptionName:  "public",
-                    Description: "Show to everyone",
-                    Required:    false,
-                },
-            },
-            DefaultMemberPermissions: &perm,
-        },
-    }
-
-    if _, err := b.s.BulkOverwriteCommands(b.s.Ready().Application.ID, commands); err != nil {
-        return fmt.Errorf("overwrite: %w", err)
-    }
-
-    existingCommands, err := b.s.Commands(b.s.Ready().Application.ID)
-    if err == nil {
-        for _, command := range existingCommands {
-            if command.Name == "askmd" {
-                if err := b.s.DeleteCommand(b.s.Ready().Application.ID, command.ID); err != nil {
-                    return fmt.Errorf("delete: %w", err)
-                }
-            }
-        }
-    }
-    return nil
-}
+var drafts = make(map[int64]*QuestionDraft)
 
 func (b *Bot) handleInteraction(e *gateway.InteractionCreateEvent) {
-    defer func () {
-        err := recover()
-        if err != nil {
-            b.respondError(e, fmt.Sprintf("Unhandled error: %v", err))
-        }
-    } ()
-    switch data := e.Data.(type) {
-    case *discord.CommandInteraction:
-        switch data.Name {
-        case "ask":
-            b.handleAskCommand(e)
-        case "result":
-            b.handleResultCommand(e)
-        case "close":
-            b.handleCloseCommand(e)
-        case "askmd":
-            b.handleAskMarkdownCommand(e)
-        case "analyze":
-            b.handleAnalyzeCommand(e)
-        case "list":
-            b.handleListCommand(e)
-        }
-    case *discord.ButtonInteraction:
-        b.handleButtonClick(e)
-    }
+	defer func() {
+		err := recover()
+		if err != nil {
+			b.respondError(e, fmt.Sprintf("Unhandled error: %v", err))
+		}
+	}()
+	var err error
+	switch data := e.Data.(type) {
+	case *discord.CommandInteraction:
+		switch data.Name {
+		case "ask":
+			err = b.handleAskCommand(e)
+		case "result":
+			err = b.handleResultCommand(e)
+		case "close":
+			err = b.handleCloseCommand(e)
+		case "post":
+			err = b.handlePostCommand(e)
+		case "analyze":
+			err = b.handleAnalyzeCommand(e)
+		case "list":
+			err = b.handleListCommand(e)
+		case "Make questions":
+			err = b.handleParseCommand(e)
+		}
+	case *discord.ButtonInteraction:
+		err = b.handleButtonClick(e)
+	}
+
+	if err != nil {
+		log.Printf("%v", err)
+	}
+
+	for _, draft := range drafts {
+		if time.Since(draft.lastEdited) > time.Hour*24 {
+			delete(drafts, draft.DraftID)
+		}
+	}
 }
 
-func (b *Bot) handleAskCommand(e *gateway.InteractionCreateEvent) {
-    data := e.Data.(*discord.CommandInteraction)
-    
-    // Check permissions
-    member, err := b.s.Member(e.GuildID, e.Member.User.ID)
-    if err != nil {
-        b.respondError(e, "Failed to get member")
-        return
-    }
-    perms, err := b.s.Permissions(e.ChannelID, member.User.ID)
-    if err != nil || !perms.Has(discord.PermissionManageChannels) {
-        b.respondError(e, "You need to have the Manage Channels permission to create polls")
-        return
-    }
+// func ParseQuestionMarkdown (md string) (*Question, error) {
 
-    question := data.Options[0].String()
-    options := make([]string, 0)
-    var answerId = 0
-    
-    // Collect options
-    for i := 1; i < len(data.Options); i++ {
-        if data.Options[i].Name == "answer" {
-            // customAnswer, _ = data.Options[i].BoolValue()
-        } else if data.Options[i].Name == "answer_id" {
-            aId, _ :=  data.Options[i].IntValue()
-            answerId = int(aId)
-        } else if data.Options[i].String() != "" {
-            options = append(options, data.Options[i].String())
-        }
-    }
+// }
 
-    // Create buttons
-    components := make([]discord.Component, len(options))
-    for i, opt := range options {
-        components[i] = &discord.ButtonComponent{
-            CustomID: discord.ComponentID(fmt.Sprintf("opt_%d", i)),
-            Label:    opt,
-            Style:    discord.PrimaryButtonStyle(),
-        }
-    }
+func (b *Bot) preparePost(q *Question) (api.SendMessageData, error) {
 
-    // Store in database
-    result, err := b.db.Exec(
-        "INSERT INTO questions (creator_id, question, correct_answer_id, options, message_id, channel_id, guild_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        e.Member.User.ID,
-        question,
-        answerId,
-        strings.Join(options, "|"),
-        "0",
-        e.ChannelID.String(),
-        e.GuildID.String(),
-    )
-    if err != nil {
-        b.respondError(e, "Failed to store poll")
-        return
-    }
+	content := q.Question + fmt.Sprintf("-# \\#%d", q.QID)
 
-    questionID, _ := result.LastInsertId()
+	components := make([]discord.Component, len(q.Options))
+	for i, opt := range q.Options {
+		components[i] = &discord.ButtonComponent{
+			CustomID: discord.ComponentID(fmt.Sprintf("opt_%d_%d", q.QID, i)),
+			Label:    opt,
+			Style:    discord.PrimaryButtonStyle(),
+		}
+	}
 
-    // Send poll message
-    msg, err := b.s.SendMessageComplex(e.ChannelID, api.SendMessageData{
-        Content:    question,
-        Components: discord.Components(components...),
-    })
-    if err != nil {
-        b.respondError(e, "Failed to announce poll")
-        return
-    }
-
-    _, err = b.db.Exec(
-        "UPDATE questions SET message_id = ? WHERE id = ?",
-        msg.ID.String(),
-        questionID,
-    )
-    if err != nil {
-        b.respondError(e, fmt.Sprintf("Failed to set message ID %d for poll %d", msg.ID, questionID))
-        b.s.DeleteMessage(msg.ChannelID, msg.ID, "")
-        return
-    }
-
-    b.respond(e, fmt.Sprintf("Poll created with ID: %d", questionID), discord.EphemeralMessage)
+	return api.SendMessageData{
+		Content: content,
+		Components: discord.Components(
+			components...,
+		),
+	}, nil
 }
 
-func (b *Bot) handleButtonClick(e *gateway.InteractionCreateEvent) {
-    data := e.Data.(*discord.ButtonInteraction)
-    
-    // Extract question ID from message
-    var questionID int64
-    err := b.db.QueryRow("SELECT id FROM questions WHERE message_id = ? AND is_closed = FALSE", e.Message.ID.String()).Scan(&questionID)
-    if err != nil {
-        b.respondError(e, "Poll not found or closed")
-        return
-    }
+func (b *Bot) postQuestion(qId int64, channelId int64) error {
+	q, err := b.queryQuestion(qId)
+	if err != nil {
+		return fmt.Errorf("Question not found: %w", err)
+	}
 
-    // Record response
-    _, err = b.db.Exec(
-        "INSERT OR REPLACE INTO responses (question_id, user_id, choice) VALUES (?, ?, ?)",
-        questionID,
-        e.Member.User.ID,
-        strings.TrimPrefix(string(data.CustomID), "opt_"),
-    )
-    if err != nil {
-        b.respondError(e, "Failed to record response")
-        return
-    }
+	msgData, err := b.preparePost(q)
+	if err != nil {
+		return err
+	}
+	// Send poll message
+	_, err = b.s.SendMessageComplex(discord.ChannelID(channelId), msgData)
+	if err != nil {
+		return fmt.Errorf("Failed to post question:: %w", err)
+	}
 
-    b.respond(e, "Your response has been recorded!", discord.EphemeralMessage)
+	return nil
 }
 
-func (b *Bot) handleResultCommand(e *gateway.InteractionCreateEvent) {
-    data := e.Data.(*discord.CommandInteraction)
-    questionID, err := data.Options[0].IntValue()
-    if err != nil {
-        b.respondError(e, "Invalid question ID")
-        return
-    }
+func (b *Bot) handleButtonClick(e *gateway.InteractionCreateEvent) error {
+	data := e.Data.(*discord.ButtonInteraction)
 
-    showToEveryone := false
-    if opt := data.Options.Find("public"); opt.Name != "" {
-        showToEveryone, err = opt.BoolValue()
-        if err != nil {
-            b.respondError(e, "Invalid public value")
-            return
-        }
-    }
+	if strings.HasPrefix(string(data.CustomID), "ask_") {
+		askIdStr, valid := strings.CutPrefix(string(data.CustomID), "ask_")
+		if !valid {
+			return fmt.Errorf("Invalid ask ID")
+		}
 
-    // Check permissions
-    member, err := b.s.Member(e.GuildID, e.Member.User.ID)
-    if err != nil {
-        b.respondError(e, "Failed to get member")
-        return
-    }
-    perms, err := b.s.Permissions(e.ChannelID, member.User.ID)
-    if err != nil || !perms.Has(discord.PermissionManageChannels) {
-        b.respondError(e, "You need to have the Manage Channels permission to create polls")
-        return
-    }
+		askId, err := strconv.ParseInt(askIdStr, 10, 64)
+		if err != nil {
+			return err
+		}
 
+		d, ok := drafts[askId]
+		if !ok {
+			b.respondError(e, "Draft not found")
+			return err
+		}
 
-    // Get question info
-    var creationTime time.Time
-    var options string
-    var question string
-    var aId int = -1
-    var guildId string
-    err = b.db.QueryRow(
-        "SELECT question, creation_time, options, correct_answer_id, guild_id FROM questions WHERE id = ?",
-        questionID,
-    ).Scan(&question, &creationTime, &options, &aId, &guildId)
-    if err != nil {
-        b.respondError(e, "Poll not found")
-        return
-    }
+		q, err := b.insertQuestion(d.Question)
+		if err != nil {
+			b.respondError(e, "Failed to insert question")
+			return err
+		}
 
-    if guildId != e.GuildID.String() {
-        b.respondError(e, "Poll not found")
-        return
-    }
+		if err := b.postQuestion(q.QID, int64(e.ChannelID)); err != nil {
+			b.respondError(e, "Failed to post question")
+			return err
+		}
+		b.respond(e, fmt.Sprintf("🆗"), discord.EphemeralMessage)
+	} else if strings.HasPrefix(string(data.CustomID), "cancel_ask_") {
+		askIdStr, valid := strings.CutPrefix(string(data.CustomID), "cancel_ask_")
+		if !valid {
+			return fmt.Errorf("Invalid ask ID")
+		}
 
-    // Get response counts
-    rows, err := b.db.Query(`
-        SELECT 
-            choice,
-            COUNT(*) as count,
-            GROUP_CONCAT(user_id) as users,
-            GROUP_CONCAT(unixepoch(response_time)) as response_times
-        FROM responses 
-        WHERE question_id = ?
-        GROUP BY choice
-        ORDER BY MIN(response_time)`,
-        questionID,
-    )
-    if err != nil {
-        b.respondError(e, "Failed to get results")
-        return
-    }
-    defer rows.Close()
+		askId, err := strconv.ParseInt(askIdStr, 10, 64)
+		if err != nil {
+			return err
+		}
 
-    optionsList := strings.Split(options, "|")
-    totalResponses := 0
-    var result strings.Builder
+		delete(drafts, askId)
+		b.s.DeleteMessage(e.ChannelID, e.Message.ID, "")
+		b.respond(e, fmt.Sprintf("Cancelled!"), discord.EphemeralMessage)
+	} else if strings.HasPrefix(string(data.CustomID), "opt_") {
+		match, err := responseButtonRegex.FindStringMatch(string(data.CustomID))
+		if err != nil {
+			return err
+		}
+		if match == nil {
+			return fmt.Errorf("invalid response button ID")
+		}
 
-    result.WriteString(fmt.Sprintf("**Question**\n%s\n\n", question))
-    for rows.Next() {
-        var choice string
-        var respTimes string
-        var count int
-        var users string
-        rows.Scan(&choice, &count, &users, &respTimes)
+		g := match.Groups()
+		if len(g) != 3 {
+			return fmt.Errorf("invalid response button ID")
+		}
 
-        respTimesList := strings.Split(respTimes, ",")
-        var respTime []time.Time = make([]time.Time, 0)
-        for _, v := range respTimesList {
-            t, err := strconv.ParseInt(v, 10, 64)
-            if err != nil {
-                log.Printf("Failed to parse response time: %v", err)
-            }
-            respTime = append(respTime, time.Unix(t, 0))
-            respTimesList = respTimesList[1:]
-        }
-        
-        choiceIdx, _ := strconv.Atoi(choice)
-        optionText := optionsList[choiceIdx]
-        totalResponses += count
-        
-        if aId != -1 && choiceIdx == aId {
-            result.WriteString("✅")
-        }
-        result.WriteString(fmt.Sprintf("**Option:** %s\n", optionText))
-        result.WriteString(fmt.Sprintf("Responses: %d (%.1f%%)\n", count, float64(count)*100/float64(totalResponses)))
-        for i, userID := range strings.Split(users, ",") {
-            t := respTime[0]
-            respTime = respTime[1:]
-            result.WriteString(fmt.Sprintf("%d. <@%s> (<t:%d:R>)\n", i+1, userID, t.Unix()))
-        }
-    }
+		qId, err := strconv.ParseInt(g[1].String(), 10, 64)
+		if err != nil {
+			return err
+		}
+		rId, err := strconv.ParseInt(g[2].String(), 10, 64)
+		if err != nil {
+			return err
+		}
 
-    result.WriteString(fmt.Sprintf("\nPoll created at: <t:%d> (<t:%d:R>)\n", creationTime.Unix(), creationTime.Unix()))
-    result.WriteString(fmt.Sprintf("Total responses: %d", totalResponses))
-    if showToEveryone {
-        b.respond(e, result.String(), 0)
-    } else {
-        b.respond(e, result.String(), discord.EphemeralMessage)
-    }
-}
+		// Extract question ID from message
+		var questionID int64
+		err = b.db.QueryRow("SELECT id FROM questions WHERE id = ? AND is_closed = FALSE", qId).Scan(&questionID)
+		if err != nil {
+			b.respondError(e, "Poll not found or closed")
+			return err
+		}
 
-func (b *Bot) handleAskMarkdownCommand(e *gateway.InteractionCreateEvent) {
-    data := e.Data.(*discord.CommandInteraction)
-    
-    // Check permissions
-    member, err := b.s.Member(e.GuildID, e.Member.User.ID)
-    if err != nil {
-        b.respondError(e, "Failed to get member")
-        return
-    }
-    perms, err := b.s.Permissions(e.ChannelID, member.User.ID)
-    if err != nil || !perms.Has(discord.PermissionManageChannels) {
-        b.respondError(e, "You need to have the Manage Channels permission to create polls")
-        return
-    }
+		// Record response
+		_, err = b.db.Exec(
+			"INSERT OR REPLACE INTO responses (question_id, user_id, choice) VALUES (?, ?, ?)",
+			questionID,
+			e.Member.User.ID,
+			rId,
+		)
+		if err != nil {
+			b.respondError(e, "Failed to record response")
+			return err
+		}
+		b.respond(e, fmt.Sprintf("🆗"), discord.EphemeralMessage)
+	}
 
-    markdown := data.Options[0].String()
-    lines := strings.Split(markdown, "\n")
-    
-    if len(lines) < 2 {
-        b.respondError(e, "Invalid markdown format. Expected: [question]\\n- [option1]\\n- [option2]...")
-        return
-    }
-
-    // Extract question and options
-    question := strings.TrimSpace(lines[0])
-    options := make([]string, 0)
-    
-    for _, line := range lines[1:] {
-        line = strings.TrimSpace(line)
-        if strings.HasPrefix(line, "-") {
-            option := strings.TrimSpace(strings.TrimPrefix(line, "-"))
-            if option != "" {
-                options = append(options, option)
-            }
-        }
-    }
-
-    if len(options) == 0 {
-        b.respondError(e, "No options found in markdown")
-        return
-    }
-
-    // Create buttons
-    components := make([]discord.Component, len(options))
-    for i, opt := range options {
-        components[i] = &discord.ButtonComponent{
-            CustomID: discord.ComponentID(fmt.Sprintf("opt_%d", i)),
-            Label:    opt,
-            Style:    discord.PrimaryButtonStyle(),
-        }
-    }
-
-    // Send poll message
-    msg, err := b.s.SendMessageComplex(e.ChannelID, api.SendMessageData{
-        Content:    question,
-        Components: discord.Components(components...),
-    })
-    if err != nil {
-        b.respondError(e, "Failed to create poll")
-        return
-    }
-
-    // Store in database
-    result, err := b.db.Exec(
-        "INSERT INTO questions (creator_id, question, options, take_custom_answer, message_id, channel_id) VALUES (?, ?, ?, ?, ?, ?)",
-        e.Member.User.ID,
-        question,
-        strings.Join(options, "|"),
-        false,
-        msg.ID.String(),
-        e.ChannelID.String(),
-    )
-    if err != nil {
-        b.respondError(e, "Failed to store poll")
-        return
-    }
-
-    questionID, _ := result.LastInsertId()
-    b.respond(e, fmt.Sprintf("Poll created with ID: %d", questionID), discord.EphemeralMessage)
-}
-
-func (b *Bot) handleListCommand(e *gateway.InteractionCreateEvent) {
-    data := e.Data.(*discord.CommandInteraction)
-    
-    // Check permissions
-    member, err := b.s.Member(e.GuildID, e.Member.User.ID)
-    if err != nil {
-        b.respondError(e, "Failed to get member")
-        return
-    }
-    perms, err := b.s.Permissions(e.ChannelID, member.User.ID)
-    if err != nil || !perms.Has(discord.PermissionManageChannels) {
-        b.respondError(e, "You need to have the Manage Channels permission to view polls")
-        return
-    }
-
-    count := int64(10)
-    if opt := data.Options.Find("count"); opt.Name != "" {
-        count, err = opt.IntValue()
-        if err != nil {
-            b.respondError(e, "Invalid count value")
-            return
-        }
-    }
-
-    showToEveryone := false
-    if opt := data.Options.Find("public"); opt.Name != "" {
-        showToEveryone, err = opt.BoolValue()
-        if err != nil {
-            b.respondError(e, "Invalid public value")
-            return
-        }
-    }
-
-    // Get recent questions
-    rows, err := b.db.Query(`
-        SELECT id, question, creation_time
-        FROM questions 
-        WHERE guild_id = ?
-        ORDER BY creation_time ASC
-        LIMIT ?`,
-        e.GuildID.String(),
-        count,
-    )
-    if err != nil {
-        b.respondError(e, "Failed to get questions")
-        return
-    }
-    defer rows.Close()
-
-    var result strings.Builder
-    result.WriteString("**Recent Questions**\n\n")
-    
-    i := 1
-    for rows.Next() {
-        var id int64
-        var question string
-        var creationTime time.Time
-        err := rows.Scan(&id, &question, &creationTime)
-        if err != nil {
-            continue
-        }
-        
-        result.WriteString(fmt.Sprintf("- **#%d**: %s (<t:%d:R>)\n", 
-            id, question, creationTime.Unix()))
-        i++
-    }
-
-    if i == 1 {
-        b.respondError(e, "No questions found")
-        return
-    }
-
-    if showToEveryone {
-        b.respond(e, result.String(), 0)
-    } else {
-        b.respond(e, result.String(), discord.EphemeralMessage)
-    }
-}
-
-func (b *Bot) handleAnalyzeCommand(e *gateway.InteractionCreateEvent) {
-    data := e.Data.(*discord.CommandInteraction)
-    
-    // Check permissions
-    member, err := b.s.Member(e.GuildID, e.Member.User.ID)
-    if err != nil {
-        b.respondError(e, "Failed to get member")
-        return
-    }
-    perms, err := b.s.Permissions(e.ChannelID, member.User.ID)
-    if err != nil || !perms.Has(discord.PermissionManageChannels) {
-        b.respondError(e, "You need to have the Manage Channels permission to view analysis")
-        return
-    }
-
-    showToEveryone := false
-    if opt := data.Options.Find("public"); opt.Name != "" {
-        showToEveryone, err = opt.BoolValue()
-        if err != nil {
-            b.respondError(e, "Invalid public value")
-            return
-        }
-    }
-
-    // Parse question IDs
-    questionIDs := strings.Split(data.Options[0].String(), ",")
-    var result strings.Builder
-    
-    // Track statistics
-    type UserStats struct {
-        correct int
-        total   int
-    }
-    userStats := make(map[string]*UserStats)
-    type QuestionStats struct {
-        id            int64
-        question      string
-        correct       int
-        total        int
-        correctUsers []string
-    }
-    var questionStats []QuestionStats
-    totalCorrect := 0
-    totalAnswers := 0
-
-    // Analyze each question
-    for _, qIDStr := range questionIDs {
-        qID, err := strconv.ParseInt(strings.TrimSpace(qIDStr), 10, 64)
-        if err != nil {
-            continue
-        }
-
-        // Get question info
-        var question string
-        var options string
-        var correctAnswerID int
-        var guildId string
-        err = b.db.QueryRow(
-            "SELECT question, options, correct_answer_id, guild_id FROM questions WHERE id = ?",
-            qID,
-        ).Scan(&question, &options, &correctAnswerID, &guildId)
-        if err != nil {
-            continue
-        }
-
-        if guildId != e.GuildID.String() {
-            b.respondError(e, fmt.Sprintf("Q#%d is not your poll!", qID))
-            return
-        }
-
-        result.WriteString(fmt.Sprintf("\n**Question %d**: %s\n", qID, question))
-        optionsList := strings.Split(options, "|")
-        
-        // Get responses
-        rows, err := b.db.Query(`
-            SELECT 
-                choice,
-                COUNT(*) as count,
-                GROUP_CONCAT(user_id) as users
-            FROM responses 
-            WHERE question_id = ?
-            GROUP BY choice
-            ORDER BY choice`,
-            qID,
-        )
-        if err != nil {
-            continue
-        }
-
-        qStats := QuestionStats{
-            id:       qID,
-            question: question,
-        }
-
-        // Process responses
-        totalResponses := 0
-        optionCounts := make(map[int]int)
-        optionUsers := make(map[int][]string)
-        
-        for rows.Next() {
-            var choice string
-            var count int
-            var users string
-            rows.Scan(&choice, &count, &users)
-            
-            choiceIdx, _ := strconv.Atoi(choice)
-            optionCounts[choiceIdx] = count
-            optionUsers[choiceIdx] = strings.Split(users, ",")
-            totalResponses += count
-        }
-        rows.Close()
-
-        // Show results for each option
-        for i, opt := range optionsList {
-            count := optionCounts[i]
-            if totalResponses > 0 {
-                percentage := float64(count) * 100 / float64(totalResponses)
-                
-                if i == correctAnswerID {
-                    result.WriteString(fmt.Sprintf("✅ **%s**: %d (%.1f%%)\n", opt, count, percentage))
-                    qStats.correct = count
-                    qStats.correctUsers = optionUsers[i]
-                    
-                    // Update user stats
-                    for _, userID := range optionUsers[i] {
-                        if _, exists := userStats[userID]; !exists {
-                            userStats[userID] = &UserStats{}
-                        }
-                        userStats[userID].correct++
-                    }
-                }
-                
-                // result.WriteString(fmt.Sprintf("**%s**: %d (%.1f%%)\n", opt, count, percentage))
-                
-                // Update total stats for this question
-                qStats.total += count
-                
-                // Update user totals
-                for _, userID := range optionUsers[i] {
-                    if _, exists := userStats[userID]; !exists {
-                        userStats[userID] = &UserStats{}
-                    }
-                    userStats[userID].total++
-                }
-            }
-        }
-        
-        if totalResponses == 0 {
-            result.WriteString("❌ *No responses*\n")
-        }
-
-        if correctAnswerID >= 0 && totalResponses > 0 {
-            correctCount := optionCounts[correctAnswerID]
-            // correctPercentage := float64(correctCount) * 100 / float64(totalResponses)
-            // result.WriteString(fmt.Sprintf("\nCorrect answers: %d (%.1f%%)\n", correctCount, correctPercentage))
-            
-            // Update global stats
-            totalCorrect += correctCount
-            totalAnswers += totalResponses
-        }
-
-        questionStats = append(questionStats, qStats)
-        // result.WriteString("\n---\n")
-        result.WriteString("\n")
-    }
-
-    if len(questionStats) == 0 {
-        b.respondError(e, "❌ *No question/response data!*")
-        return
-    }
-
-    // Generate summary
-    result.WriteString("### \n**Summary**\n\n")
-    
-    // Top 10 users
-    type UserRank struct {
-        id      string
-        correct int
-        total   int
-    }
-    var userRanks []UserRank
-    for userID, stats := range userStats {
-        userRanks = append(userRanks, UserRank{userID, stats.correct, stats.total})
-    }
-    sort.Slice(userRanks, func(i, j int) bool {
-        return userRanks[i].correct > userRanks[j].correct
-    })
-
-    result.WriteString("**Top 10 Users**\n")
-    for i := 0; i < len(userRanks) && i < 10; i++ {
-        user := userRanks[i]
-        if user.total > 0 {
-            percentage := float64(user.correct) * 100 / float64(user.total)
-            result.WriteString(fmt.Sprintf("%d. <@%s>: %d/%d correct (%.1f%%)\n", 
-                i+1, user.id, user.correct, user.total, percentage))
-        }
-    }
-    result.WriteString("\n")
-
-    // Questions ranked by correct answers
-    sort.Slice(questionStats, func(i, j int) bool {
-        iPerc := float64(0)
-        if questionStats[i].total > 0 {
-            iPerc = float64(questionStats[i].correct) / float64(questionStats[i].total)
-        }
-        jPerc := float64(0)
-        if questionStats[j].total > 0 {
-            jPerc = float64(questionStats[j].correct) / float64(questionStats[j].total)
-        }
-        return iPerc > jPerc
-    })
-
-    result.WriteString("**Questions Ranked by Correct Answers**\n")
-    for i, q := range questionStats {
-        if q.total > 0 {
-            percentage := float64(q.correct) * 100 / float64(q.total)
-            result.WriteString(fmt.Sprintf("%d. Q#%d: %.1f%% correct (%d/%d)\n",
-                i+1, q.id, percentage, q.correct, q.total))
-        }
-    }
-    result.WriteString("\n")
-
-    // Overall statistics
-    if totalAnswers > 0 {
-        overallPercentage := float64(totalCorrect) * 100 / float64(totalAnswers)
-        result.WriteString(fmt.Sprintf("**Overall Statistics**\n"))
-        result.WriteString(fmt.Sprintf("Total answers: %d\n", totalAnswers))
-        result.WriteString(fmt.Sprintf("Correct answers: %d (%.1f%%)\n", totalCorrect, overallPercentage))
-    }
-
-    if showToEveryone {
-        b.respond(e, result.String(), 0)
-    } else {
-        b.respond(e, result.String(), discord.EphemeralMessage)
-    }
-}
-
-func (b *Bot) handleCloseCommand(e *gateway.InteractionCreateEvent) {
-    data := e.Data.(*discord.CommandInteraction)
-    questionID, err := data.Options[0].IntValue()
-    if err != nil {
-        b.respondError(e, "Invalid question ID")
-        return
-    }
-
-    // Check permissions
-    member, err := b.s.Member(e.GuildID, e.Member.User.ID)
-    if err != nil {
-        b.respondError(e, "Failed to get member")
-        return
-    }
-    perms, err := b.s.Permissions(e.ChannelID, member.User.ID)
-    if err != nil || !perms.Has(discord.PermissionManageChannels) {
-        b.respondError(e, "You need to have the Manage Channels permission to create polls")
-        return
-    }
-
-    // Close the poll
-    _, err = b.db.Exec("UPDATE questions SET is_closed = TRUE WHERE id = ? AND guild_id = ?", questionID, e.GuildID.String())
-    if err != nil {
-        b.respondError(e, "Failed to close poll")
-        return
-    }
-
-    b.respond(e, fmt.Sprintf("Poll %d has been closed", questionID), discord.EphemeralMessage)
+	return nil
 }
 
 func (b *Bot) respond(e *gateway.InteractionCreateEvent, content string, flags discord.MessageFlags) {
-    err := b.s.RespondInteraction(e.ID, e.Token, api.InteractionResponse{
-        Type: api.MessageInteractionWithSource,
-        Data: &api.InteractionResponseData{
-            Content: option.NewNullableString(content),
-            Flags: flags,
-        },
-    })
-    if err != nil {
-        log.Printf("Failed to respond to interaction: %v", err)
-    }
+	err := b.s.RespondInteraction(e.ID, e.Token, api.InteractionResponse{
+		Type: api.MessageInteractionWithSource,
+		Data: &api.InteractionResponseData{
+			Content: option.NewNullableString(content),
+			Flags:   flags,
+		},
+	})
+	if err != nil {
+		log.Printf("Failed to respond to interaction: %v", err)
+	}
 }
 
 func (b *Bot) respondError(e *gateway.InteractionCreateEvent, message string) {
-    err := b.s.RespondInteraction(e.ID, e.Token, api.InteractionResponse{
-        Type: api.MessageInteractionWithSource,
-        Data: &api.InteractionResponseData{
-            Content: option.NewNullableString("Error: " + message),
-            Flags:   discord.EphemeralMessage,
-        },
-    })
-    if err != nil {
-        log.Printf("Failed to respond to interaction: %v", err)
-    }
+	err := b.s.RespondInteraction(e.ID, e.Token, api.InteractionResponse{
+		Type: api.MessageInteractionWithSource,
+		Data: &api.InteractionResponseData{
+			Content: option.NewNullableString("❌" + message),
+			Flags:   discord.EphemeralMessage,
+		},
+	})
+	if err != nil {
+		log.Printf("Failed to respond to interaction: %v", err)
+	}
+}
+
+func parseIds(ids string) []int64 {
+	var result []int64
+	for _, id := range strings.Split(ids, ",") {
+		i, err := strconv.ParseInt(id, 10, 64)
+		if err != nil {
+			continue
+		}
+		result = append(result, i)
+	}
+	return result
 }
