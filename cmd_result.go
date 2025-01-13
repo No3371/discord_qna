@@ -102,6 +102,10 @@ func (b *Bot) handleResultCommand(e *gateway.InteractionCreateEvent) error {
 		}
 	}
 
+    if totalResponses == 0 {
+        result.WriteString("❌ *No responses*\n")
+    }
+
 	result.WriteString(fmt.Sprintf("\nCreated by <@%d> at: <t:%d> (<t:%d:R>)\n", q.CreatorID, q.CreatedAt.Unix(), q.CreatedAt.Unix()))
 	result.WriteString(fmt.Sprintf("Total responses: %d", totalResponses))
 	if showToEveryone {
