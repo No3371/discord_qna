@@ -1,8 +1,12 @@
 package main
 
 import (
+	"time"
+
+	"github.com/diamondburned/arikawa/v3/api"
 	"github.com/diamondburned/arikawa/v3/discord"
 	"github.com/diamondburned/arikawa/v3/gateway"
+	"github.com/diamondburned/arikawa/v3/utils/json/option"
 )
 
 
@@ -21,20 +25,35 @@ func (b *Bot) handlePostCommand(e *gateway.InteractionCreateEvent) error {
         return err
     }
 
-	
-    qId, err := data.Options.Find("question_id").IntValue()
+    qIds := parseIds(data.Options.Find("question_ids").String())
+
+	if len(qIds) == 0 {
+		b.respondError(e, "No question ID provided")
+		return nil
+	}
+    
+    err = b.s.RespondInteraction(e.ID, e.Token, api.InteractionResponse{
+		Type: api.DeferredMessageInteractionWithSource,
+	})
     if err != nil {
-        b.respondError(e, "Invalid question ID")
         return err
     }
 
-    err = b.postQuestion(qId, int64(e.ChannelID))
-    if err != nil {
-        b.respondError(e, "Failed to post question")
-        return err
+    for _, qId := range qIds {
+        err = b.postQuestion(qId, int64(e.ChannelID))
+        if err != nil {
+            b.respondError(e, "Failed to post question")
+            return err
+        }
+        <-time.NewTimer(time.Second).C
     }
 
-    b.respond(e, "🆗", discord.EphemeralMessage)
+    _, err = b.s.EditInteractionResponse(e.AppID, e.Token, api.EditInteractionResponseData{
+        Content: option.NewNullableString("🆗"),
+	})
+    if err != nil {
+        return err
+    }
 
 	return nil
 }

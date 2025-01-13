@@ -185,9 +185,9 @@ func (b *Bot) registerCommands() error {
             Name:        "post",
             Description: "Post a question",
             Options: []discord.CommandOption{
-                &discord.IntegerOption{
-                    OptionName:  "question_id",
-                    Description: "ID of the poll",
+                &discord.StringOption{
+                    OptionName:  "question_ids",
+                    Description: "Comma-separated list of question IDs (e.g. 1,2,3)",
                     Required:    true,
                 },
             },
