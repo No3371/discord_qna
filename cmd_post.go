@@ -34,6 +34,9 @@ func (b *Bot) handlePostCommand(e *gateway.InteractionCreateEvent) error {
     
     err = b.s.RespondInteraction(e.ID, e.Token, api.InteractionResponse{
 		Type: api.DeferredMessageInteractionWithSource,
+        Data: &api.InteractionResponseData{
+            Flags: discord.EphemeralMessage,
+        },
 	})
     if err != nil {
         return err
@@ -42,7 +45,9 @@ func (b *Bot) handlePostCommand(e *gateway.InteractionCreateEvent) error {
     for _, qId := range qIds {
         err = b.postQuestion(qId, int64(e.ChannelID))
         if err != nil {
-            b.respondError(e, "Failed to post question")
+            _, err = b.s.EditInteractionResponse(e.AppID, e.Token, api.EditInteractionResponseData{
+                Content: option.NewNullableString("❌Failed to post question"),
+            })
             return err
         }
         <-time.NewTimer(time.Second).C
