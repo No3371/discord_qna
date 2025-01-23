@@ -54,6 +54,7 @@ func (b *Bot) handleAnalyzeCommand(e *gateway.InteractionCreateEvent) error {
     var questionStats []QuestionStats
     totalCorrect := 0
     totalAnswers := 0
+    anyAnon := false
 
     // Analyze each question
     for _, qIDStr := range questionIDs {
@@ -68,10 +69,11 @@ func (b *Bot) handleAnalyzeCommand(e *gateway.InteractionCreateEvent) error {
         var correctAnswerID int
         var guildId string
         var isClosed bool
+        var isAnon bool
         err = b.db.QueryRow(
-            "SELECT question, options, answer_id, guild_id, is_closed FROM questions WHERE id = ?",
+            "SELECT question, options, answer_id, guild_id, is_closed, is_anon FROM questions WHERE id = ?",
             qID,
-        ).Scan(&question, &options, &correctAnswerID, &guildId, &isClosed)
+        ).Scan(&question, &options, &correctAnswerID, &guildId, &isClosed, &isAnon)
         if err != nil {
             continue
         }
@@ -85,6 +87,10 @@ func (b *Bot) handleAnalyzeCommand(e *gateway.InteractionCreateEvent) error {
             result.WriteString("\n🔒")
         } else {
             result.WriteString("\n🔓")
+        }
+        if isAnon {
+            result.WriteString("㊙️")
+            anyAnon = true
         }
 
         if strings.Contains(question, "\n") {
@@ -144,12 +150,14 @@ func (b *Bot) handleAnalyzeCommand(e *gateway.InteractionCreateEvent) error {
                     qStats.correct = count
                     qStats.correctUsers = optionUsers[i]
                     
-                    // Update user stats
-                    for _, userID := range optionUsers[i] {
-                        if _, exists := userStats[userID]; !exists {
-                            userStats[userID] = &UserStats{}
+                    if !isAnon {
+                        // Update user stats
+                        for _, userID := range optionUsers[i] {
+                            if _, exists := userStats[userID]; !exists {
+                                userStats[userID] = &UserStats{}
+                            }
+                            userStats[userID].correct++
                         }
-                        userStats[userID].correct++
                     }
                 }
                 
@@ -158,12 +166,14 @@ func (b *Bot) handleAnalyzeCommand(e *gateway.InteractionCreateEvent) error {
                 // Update total stats for this question
                 qStats.total += count
                 
-                // Update user totals
-                for _, userID := range optionUsers[i] {
-                    if _, exists := userStats[userID]; !exists {
-                        userStats[userID] = &UserStats{}
+                if !isAnon {
+                    // Update user totals
+                    for _, userID := range optionUsers[i] {
+                        if _, exists := userStats[userID]; !exists {
+                            userStats[userID] = &UserStats{}
+                        }
+                        userStats[userID].total++
                     }
-                    userStats[userID].total++
                 }
             }
         }
@@ -210,6 +220,9 @@ func (b *Bot) handleAnalyzeCommand(e *gateway.InteractionCreateEvent) error {
     })
 
     result.WriteString("**Top 10 Users**\n")
+    if anyAnon {
+        result.WriteString("-# ㊙️ *Anonymous answers are not counted*\n")
+    }
     for i := 0; i < len(userRanks) && i < 10; i++ {
         user := userRanks[i]
         if user.total > 0 {

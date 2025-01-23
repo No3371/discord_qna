@@ -80,7 +80,8 @@ func (b *Bot) createTables() error {
             options TEXT NOT NULL,
             answer_id INTEGER NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            is_closed BOOLEAN DEFAULT FALSE
+            is_closed BOOLEAN DEFAULT FALSE,
+            is_anon BOOLEAN DEFAULT FALSE,
         )`,
         `CREATE TABLE IF NOT EXISTS responses (
             question_id INTEGER,
@@ -155,12 +156,11 @@ func (b *Bot) registerCommands() error {
                     Description: "6th option",
                     Required:    false,
                 },
-                // &discord.BooleanOption{
-                //     OptionName:  "custom",
-                //     Description: "Accept custom answer?",
-                //     Required:    false,
-                // },
-                // Add more options up to option8...
+                &discord.BooleanOption{
+                    OptionName:  "anon",
+                    Description: "Hide replied users?",
+                    Required:    false,
+                },
             },
             DefaultMemberPermissions: &perm,
         },

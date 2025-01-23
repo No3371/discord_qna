@@ -32,15 +32,16 @@ type Question struct {
 	Answer     int64     `db:"answer_id"`
 	CreatedAt  time.Time `db:"created_at"`
 	IsClosed   bool      `db:"is_closed"`
+	IsAnon   bool      `db:"is_anon"`
 	Options    []string
 }
 
 func (b *Bot) queryQuestion(qId int64) (*Question, error) {
 	q := Question{}
 	err := b.db.QueryRow(
-		"SELECT id, creator_id, guild_id, question, options, answer_id, created_at, is_closed FROM questions WHERE id = ?",
+		"SELECT id, creator_id, guild_id, question, options, answer_id, created_at, is_closed, is_anon FROM questions WHERE id = ?",
 		qId,
-	).Scan(&q.QID, &q.CreatorID, &q.GuildID, &q.Question, &q.OptionsStr, &q.Answer, &q.CreatedAt, &q.IsClosed)
+	).Scan(&q.QID, &q.CreatorID, &q.GuildID, &q.Question, &q.OptionsStr, &q.Answer, &q.CreatedAt, &q.IsClosed, &q.IsAnon)
 	if err != nil {
 		return nil, fmt.Errorf("Question not found: %w", err)
 	}
@@ -55,12 +56,13 @@ func (b *Bot) queryQuestion(qId int64) (*Question, error) {
 func (b *Bot) insertQuestion(q *Question) (*Question, error) {
 	q.OptionsStr = strings.Join(q.Options, "|")
 	result, err := b.db.Exec(
-		"INSERT INTO questions (creator_id, guild_id, question, options, answer_id) VALUES (?, ?, ?, ?, ?)",
+		"INSERT INTO questions (creator_id, guild_id, question, options, answer_id, is_anon) VALUES (?, ?, ?, ?, ?, ?)",
 		q.CreatorID,
 		q.GuildID,
 		q.Question,
 		q.OptionsStr,
 		q.Answer,
+		q.IsAnon,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to store question: %w", err)
@@ -128,6 +130,10 @@ func (b *Bot) handleInteraction(e *gateway.InteractionCreateEvent) {
 func (b *Bot) preparePost(q *Question) (api.SendMessageData, error) {
 
 	content := q.Question + fmt.Sprintf("-# \\#%d", q.QID)
+	
+	if q.IsAnon {
+		content = "[㊙️ Anonymous]\n" + content
+	}
 
 	components := make([]discord.Component, len(q.Options))
 	for i, opt := range q.Options {

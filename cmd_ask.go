@@ -25,17 +25,22 @@ func (b *Bot) handleAskCommand(e *gateway.InteractionCreateEvent) error {
 	data := e.Data.(*discord.CommandInteraction)
 	question := data.Options[0].String()
 	options := make([]string, 0)
+	isAnon := false
 	var answerId = 0
 
 	// Collect options
 	for i := 1; i < len(data.Options); i++ {
-		if data.Options[i].Name == "answer" {
-			// customAnswer, _ = data.Options[i].BoolValue()
-		} else if data.Options[i].Name == "answer_id" {
-			aId, _ := data.Options[i].IntValue()
-			answerId = int(aId)
-		} else if data.Options[i].String() != "" {
-			options = append(options, data.Options[i].String())
+		switch data.Options[i].Name {
+			case "answer":
+			case "answer_id":
+				aId, _ := data.Options[i].IntValue()
+				answerId = int(aId)
+			case "anon":
+				isAnon, _ = data.Options[i].BoolValue()
+			default:
+				if data.Options[i].String() != "" {
+					options = append(options, data.Options[i].String())
+				}
 		}
 	}
 
@@ -55,6 +60,7 @@ func (b *Bot) handleAskCommand(e *gateway.InteractionCreateEvent) error {
 		Question:  question,
 		Options:   options,
 		Answer:    int64(answerId),
+		IsAnon: isAnon,
 	}
 
 	d := QuestionDraft{
@@ -92,6 +98,10 @@ func (b *Bot) handleAskCommand(e *gateway.InteractionCreateEvent) error {
 			Style:    discord.DangerButtonStyle(),
 		},
 	)
+
+	if isAnon {
+		question = "[㊙️ Anonymous]\n" + question
+	}
 
 	// Send poll message
 	_, err = b.s.SendMessageComplex(e.ChannelID, api.SendMessageData{

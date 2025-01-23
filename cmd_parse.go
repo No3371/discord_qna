@@ -86,6 +86,7 @@ func parseQuestionMarkdown (md string) ([]*Question, error) {
     q := &Question{}
     var inQuestion bool
     var inOptions bool
+    // var inProps bool
 
     // Parse lines
     for _, line := range lines {
@@ -93,6 +94,7 @@ func parseQuestionMarkdown (md string) ([]*Question, error) {
         if strings.TrimSpace(line) == "" {
             inQuestion = false
             inOptions = false
+            // inProps = false
             continue
         }
 
@@ -106,6 +108,15 @@ func parseQuestionMarkdown (md string) ([]*Question, error) {
                     q.Options = append(q.Options, option[3:])
                 } else {
                     q.Options = append(q.Options, option)
+                }
+            }
+        } else if inQuestion && !inOptions && strings.HasPrefix(strings.TrimSpace(line), "@[") && strings.HasSuffix(strings.TrimSpace(line), "]"){
+            // inProps = true
+            prop := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "- "))
+            prop = strings.TrimSuffix(prop, "]")
+            switch prop {
+                case "anon": {
+                    q.IsAnon = true
                 }
             }
         } else {

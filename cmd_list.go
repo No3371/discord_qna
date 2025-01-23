@@ -44,7 +44,7 @@ func (b *Bot) handleListCommand(e *gateway.InteractionCreateEvent) error {
 
     // Get recent questions
     rows, err := b.db.Query(`
-        SELECT id, creator_id, question, created_at, is_closed
+        SELECT id, creator_id, question, created_at, is_closed, is_anon
         FROM questions 
         WHERE guild_id = ?
         ORDER BY created_at ASC
@@ -68,7 +68,8 @@ func (b *Bot) handleListCommand(e *gateway.InteractionCreateEvent) error {
         var question string
         var creationTime time.Time
         var isClosed bool
-        err := rows.Scan(&id, &creatorId, &question, &creationTime, &isClosed)
+        var isAnon bool
+        err := rows.Scan(&id, &creatorId, &question, &creationTime, &isClosed, &isAnon)
         if err != nil {
             continue
         }
@@ -77,6 +78,9 @@ func (b *Bot) handleListCommand(e *gateway.InteractionCreateEvent) error {
             result.WriteString("\n🔒")
         } else {
             result.WriteString("\n🔓")
+        }
+        if isAnon {
+            result.WriteString("㊙️")
         }
         
         if strings.Contains(question, "\n") {

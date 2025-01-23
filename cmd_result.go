@@ -98,7 +98,15 @@ func (b *Bot) handleResultCommand(e *gateway.InteractionCreateEvent) error {
 		for i, userID := range strings.Split(users, ",") {
 			t := respTime[0]
 			respTime = respTime[1:]
-			result.WriteString(fmt.Sprintf("%d. <@%s> (<t:%d:R>)\n", i+1, userID, t.Unix()))
+			if q.IsAnon {
+				result.WriteString(fmt.Sprintf("%d. `anon` (<t:%d:R>)\n", i+1, t.Unix()))
+			} else {
+				result.WriteString(fmt.Sprintf("%d. <@%s> (<t:%d:R>)\n", i+1, userID, t.Unix()))
+			}
+			if result.Len() > 1850 {
+				result.WriteString(fmt.Sprintf("*And %d more...*\n", count - 1 - i))
+				break
+			}
 		}
 	}
 
